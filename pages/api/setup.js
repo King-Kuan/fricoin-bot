@@ -1,51 +1,29 @@
-// pages/api/setup.js
-// Fricoin Bot — Webhook Registration
+// lib/firebase.js
+// Fricoin Bot — Firebase Admin SDK
 // The Palace, Inc.
 
-export default async function handler(req, res) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
+import { initializeApp, getApps, cert } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
 
-  // Always use permanent domain — never deployment URL
-  const BASE_URL = process.env.BOT_URL || 'https://fricoin-bot.vercel.app';
-  const webhookUrl = `${BASE_URL}/api/webhook`;
+function getPrivateKey() {
+  const key = process.env.FIREBASE_PRIVATE_KEY || '';
 
-  if (!token) {
-    return res.status(500).json({ error: 'TELEGRAM_BOT_TOKEN not set' });
+  // Handle all formats Vercel might store the key in
+  if (key.includes('\\n')) {
+    return key.replace(/\\n/g, '\n');
   }
-
-  try {
-    // First delete old webhook
-    await fetch(`https://api.telegram.org/bot${token}/deleteWebhook`, {
-      method: 'POST',
-    });
-
-    // Set new webhook with permanent URL
-    const response = await fetch(
-      `https://api.telegram.org/bot${token}/setWebhook`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url:                  webhookUrl,
-          allowed_updates:      ['message', 'callback_query'],
-          drop_pending_updates: true,
-        }),
-      }
-    );
-
-    const data = await response.json();
-
-    if (data.ok) {
-      res.status(200).json({
-        success: true,
-        message: '✅ Fricoin Bot webhook registered!',
-        webhook: webhookUrl,
-        telegram: data,
-      });
-    } else {
-      res.status(400).json({ success: false, telegram: data });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  return key;
 }
+
+if (!getApps().length) {
+  initializeApp({
+    credential: cert({
+      projectId:   process.env.FIREBASE_PROJECT_ID,
+      privateKey:  getPrivateKey(),
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    }),
+  });
+}
+
+const db = getFirestore();
+export default db;
