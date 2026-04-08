@@ -1,51 +1,52 @@
 // pages/api/webhook.js
-// Fricoin Bot — Main Telegram Webhook
+// Fricoin Bot v2 — Complete Webhook Handler
 // The Palace, Inc.
 
 import { Telegraf } from 'telegraf';
 import db from '../../lib/firebase.js';
 import {
-  getOrCreateUser,
-  getUser,
-  getUserByUsername,
-  setWalletAddress,
-  creditFRI,
-  debitFRI,
-  canMineToday,
-  recordMining,
-  getLeaderboard,
-  getTotalUsers,
+  getOrCreateUser, getUser, getUserByUsername,
+  setWalletAddress, debitFRI, creditReceived,
+  canMineToday, recordMining, getLeaderboard,
+  getTotalUsers, getTotalMinedGlobal, getTransactionHistory,
+  giveChannelBonus, markChannelJoined, getUserByRefCode,
+  processReferralJoin, logTransaction,
 } from '../../lib/users.js';
+import { getFRIBalance, getFricoinStats, isValidAddress } from '../../lib/blockchain.js';
 import {
-  getFRIBalance,
-  getFricoinStats,
-  isValidAddress,
-} from '../../lib/blockchain.js';
-import {
-  welcomeMessage,
-  helpMessage,
-  balanceMessage,
-  mineSuccessMessage,
-  mineCooldownMessage,
-  sendSuccessMessage,
-  receiveMessage,
-  statsMessage,
-  leaderboardMessage,
-  walletLinkedMessage,
-  DAILY_REWARD,
-  SEND_MIN,
+  welcomeMessage, helpMessage, balanceMessage, historyMessage,
+  mineSuccessMessage, mineCooldownMessage, channelGateMessage,
+  channelJoinedMessage, referMessage, newUserBonusMessage,
+  referrerNotifyMessage, milestoneMessage, sendSuccessMessage,
+  receiveMessage, statsMessage, leaderboardMessage, walletLinkedMessage,
+  DAILY_REWARD, SEND_MIN, CHANNEL_LINK, fmt,
 } from '../../lib/messages.js';
 
 // ── Bot instance ──────────────────────────────────────────
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+const CHANNEL_ID = '@FricoinNews';
 
-// ── Middleware: auto-register every user ──────────────────
+// ── Check channel membership ──────────────────────────────
+async function isMemberOfChannel(userId) {
+  try {
+    const member = await bot.telegram.getChatMember(CHANNEL_ID, userId);
+    return ['member', 'administrator', 'creator'].includes(member.status);
+  } catch {
+    return false;
+  }
+}
+
+// ── Auto-register middleware ───────────────────────────────
 bot.use(async (ctx, next) => {
   if (ctx.from) {
+    const startParam = ctx.message?.text?.startsWith('/start ')
+      ? ctx.message.text.split(' ')[1]
+      : null;
     await getOrCreateUser(
       ctx.from.id,
       ctx.from.username,
-      ctx.from.first_name
+      ctx.from.first_name,
+      startParam
     );
   }
   return next();
@@ -53,23 +54,41 @@ bot.use(async (ctx, next) => {
 
 // ── /start ────────────────────────────────────────────────
 bot.start(async (ctx) => {
-  await ctx.replyWithMarkdown(welcomeMessage(ctx.from.first_name), {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: '⛏️ Mine FRI', callback_data: 'mine' },
-          { text: '💰 Balance',  callback_data: 'balance' },
+  const param   = ctx.message.text.split(' ')[1] || null;
+  const user    = await getUser(ctx.from.id);
+  const isNew   = !user?.lastMined && user?.totalMined === 0;
+  let referrerName = null;
+
+  if (param && isNew) {
+    const referrer = await getUserByRefCode(param);
+    if (referrer && referrer.telegramId !== String(ctx.from.id)) {
+      referrerName = referrer.firstName;
+    }
+  }
+
+  await ctx.replyWithMarkdown(
+    welcomeMessage(ctx.from.first_name, user?.referralCode, isNew, referrerName),
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '📢 Join Channel & Earn +300 FRI', url: CHANNEL_LINK },
+          ],
+          [
+            { text: '✅ I Joined the Channel!', callback_data: 'verify_channel' },
+          ],
+          [
+            { text: '⛏️ Mine FRI', callback_data: 'mine' },
+            { text: '💰 Balance',  callback_data: 'balance' },
+          ],
+          [
+            { text: '👥 Refer Friends', callback_data: 'refer' },
+            { text: '📋 History',       callback_data: 'history' },
+          ],
         ],
-        [
-          { text: '📊 Stats',       callback_data: 'stats' },
-          { text: '🏆 Leaderboard', callback_data: 'top' },
-        ],
-        [
-          { text: '❓ Help', callback_data: 'help' },
-        ],
-      ],
-    },
-  });
+      },
+    }
+  );
 });
 
 // ── /help ─────────────────────────────────────────────────
@@ -81,105 +100,128 @@ bot.command('help', async (ctx) => {
 bot.command('balance', async (ctx) => {
   const user = await getUser(ctx.from.id);
   if (!user) return ctx.reply('Please /start first.');
-
   let onchain = null;
-  if (user.walletAddress) {
-    onchain = await getFRIBalance(user.walletAddress);
-  }
-
+  if (user.walletAddress) onchain = await getFRIBalance(user.walletAddress);
   await ctx.replyWithMarkdown(balanceMessage(user, onchain), {
     reply_markup: {
       inline_keyboard: [[
-        { text: '⛏️ Mine Now', callback_data: 'mine' },
-        { text: '📤 Send FRI', callback_data: 'send_help' },
-      ]],
-    },
+        { text: '⛏️ Mine', callback_data: 'mine' },
+        { text: '📋 History', callback_data: 'history' },
+        { text: '👥 Refer', callback_data: 'refer' },
+      ]]
+    }
   });
 });
 
-// ── /mine ─────────────────────────────────────────────────
-bot.command('mine', async (ctx) => {
-  await handleMine(ctx);
+// ── /history ──────────────────────────────────────────────
+bot.command('history', async (ctx) => {
+  const user = await getUser(ctx.from.id);
+  if (!user) return ctx.reply('Please /start first.');
+  const logs = await getTransactionHistory(ctx.from.id, 15);
+  await ctx.replyWithMarkdown(historyMessage(logs, ctx.from.first_name));
 });
 
+// ── /mine ─────────────────────────────────────────────────
+bot.command('mine', async (ctx) => { await handleMine(ctx); });
+
 async function handleMine(ctx) {
-  const canMine = await canMineToday(ctx.from.id);
-
-  if (!canMine) {
-    const user = await getUser(ctx.from.id);
-    const last = new Date(user.lastMined);
-    const now  = new Date();
-    const diffH = (now - last) / (1000 * 60 * 60);
-    const hoursLeft = Math.ceil(24 - diffH);
-    return ctx.replyWithMarkdown(mineCooldownMessage(hoursLeft));
-  }
-
-  // Mining animation message
-  const loadMsg = await ctx.reply('⛏️ Mining in progress...');
-
-  // Short delay for effect
-  await new Promise(r => setTimeout(r, 1500));
-
-  await recordMining(ctx.from.id, DAILY_REWARD);
   const user = await getUser(ctx.from.id);
 
-  // Edit the loading message
+  // ── Channel gate ───────────────────────────────────────
+  const isMember = await isMemberOfChannel(ctx.from.id);
+  if (!isMember) {
+    return ctx.replyWithMarkdown(channelGateMessage(), {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📢 Join @FricoinNews Now', url: CHANNEL_LINK }],
+          [{ text: '✅ I Joined! Verify Me', callback_data: 'verify_channel' }],
+        ]
+      }
+    });
+  }
+
+  // ── Give channel bonus if not yet paid ─────────────────
+  if (!user?.channelBonusPaid) {
+    const bonusPaid = await giveChannelBonus(ctx.from.id);
+    if (bonusPaid) {
+      await ctx.replyWithMarkdown(channelJoinedMessage(ctx.from.first_name, 300));
+      // Give new user referral bonus
+      if (user?.referredBy) {
+        await logTransaction(String(ctx.from.id), 'new_user_bonus', 100, 'Referral welcome bonus');
+        const ref = await getUser(user.referredBy);
+        if (ref) {
+          await bot.telegram.sendMessage(
+            user.referredBy,
+            referrerNotifyMessage(ctx.from.first_name, 200, ref.referralCount),
+            { parse_mode: 'Markdown' }
+          ).catch(() => {});
+        }
+      }
+    }
+  }
+
+  // ── Cooldown check ─────────────────────────────────────
+  const canMine = await canMineToday(ctx.from.id);
+  if (!canMine) {
+    const last  = new Date(user.lastMined);
+    const diff  = (new Date() - last) / (1000 * 60);
+    const hLeft = Math.floor((24 * 60 - diff) / 60);
+    const mLeft = Math.floor((24 * 60 - diff) % 60);
+    return ctx.replyWithMarkdown(mineCooldownMessage(hLeft, mLeft));
+  }
+
+  // ── Mine! ──────────────────────────────────────────────
+  const loadMsg = await ctx.reply('⛏️ Mining...');
+  await new Promise(r => setTimeout(r, 1200));
+
+  const rank  = await recordMining(ctx.from.id, DAILY_REWARD);
+  const fresh = await getUser(ctx.from.id);
+
+  // Calculate streak
+  const streak = Math.floor((fresh.totalMined || 0) / DAILY_REWARD);
+
   try {
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      loadMsg.message_id,
-      undefined,
-      '✅ Block found!'
-    );
+    await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, undefined, '✅ Block confirmed!');
   } catch {}
 
   await ctx.replyWithMarkdown(
-    mineSuccessMessage(
-      ctx.from.first_name,
-      DAILY_REWARD,
-      user.friBalance,
-      user.rank
-    ),
+    mineSuccessMessage(ctx.from.first_name, DAILY_REWARD, fresh.friBalance, rank, streak),
     {
       reply_markup: {
         inline_keyboard: [[
-          { text: '💰 View Balance', callback_data: 'balance' },
-          { text: '🏆 Leaderboard',  callback_data: 'top' },
-        ]],
-      },
+          { text: '💰 Balance',    callback_data: 'balance' },
+          { text: '👥 Refer & Earn', callback_data: 'refer' },
+          { text: '🏆 Leaderboard', callback_data: 'top' },
+        ]]
+      }
     }
   );
+
+  // ── Check user milestones ──────────────────────────────
+  const milestones = [100, 1000, 10000, 100000];
+  if (milestones.includes(streak)) {
+    await ctx.replyWithMarkdown(`🎉 *${streak}-Day Mining Streak!* You've been mining for ${streak} consecutive days. Legendary dedication! 💎`);
+  }
 }
 
-// ── /wallet ───────────────────────────────────────────────
-bot.command('wallet', async (ctx) => {
-  const parts   = ctx.message.text.trim().split(/\s+/);
-  const address = parts[1];
-
-  if (!address) {
-    const user = await getUser(ctx.from.id);
-    if (!user?.walletAddress) {
-      return ctx.replyWithMarkdown(
-        `🔗 *Link Your Wallet*\n\nSend your Polygon wallet address:\n\n\`/wallet 0xYourAddressHere\`\n\n_Get a wallet at metamask.io_`
-      );
+// ── /refer ────────────────────────────────────────────────
+bot.command('refer', async (ctx) => {
+  const user = await getUser(ctx.from.id);
+  if (!user) return ctx.reply('Please /start first.');
+  await ctx.replyWithMarkdown(referMessage(user), {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: '📊 View Earnings', callback_data: 'history' },
+        { text: '🏆 Top Referrers', callback_data: 'top_refs' },
+      ]]
     }
-    return ctx.replyWithMarkdown(
-      `🔗 *Your Linked Wallet*\n\n\`${user.walletAddress}\`\n\nTo change it, send:\n\`/wallet 0xNewAddress\``
-    );
-  }
-
-  if (!isValidAddress(address)) {
-    return ctx.reply('❌ Invalid wallet address. Please check and try again.');
-  }
-
-  await setWalletAddress(ctx.from.id, address);
-  await ctx.replyWithMarkdown(walletLinkedMessage(address));
+  });
 });
 
 // ── /send ─────────────────────────────────────────────────
 bot.command('send', async (ctx) => {
   const parts    = ctx.message.text.trim().split(/\s+/);
-  const toHandle = parts[1]; // @username
+  const toHandle = parts[1];
   const amount   = parseFloat(parts[2]);
 
   if (!toHandle || isNaN(amount)) {
@@ -188,61 +230,61 @@ bot.command('send', async (ctx) => {
     );
   }
 
-  if (amount < SEND_MIN) {
-    return ctx.reply(`❌ Minimum send amount is ${SEND_MIN} FRI.`);
-  }
+  if (amount < SEND_MIN) return ctx.reply(`❌ Minimum send is ${SEND_MIN} FRI.`);
 
   const sender = await getUser(ctx.from.id);
   if (!sender || sender.friBalance < amount) {
-    return ctx.reply(`❌ Insufficient balance. You have ${sender?.friBalance?.toLocaleString() || 0} FRI.`);
+    return ctx.reply(`❌ Insufficient balance. You have ${fmt(sender?.friBalance)} FRI.`);
   }
 
   const recipient = await getUserByUsername(toHandle);
-  if (!recipient) {
-    return ctx.reply(`❌ User ${toHandle} not found. They must start the bot first.`);
-  }
+  if (!recipient) return ctx.reply(`❌ User ${toHandle} not found. They must start the bot first.`);
+  if (String(recipient.telegramId) === String(ctx.from.id)) return ctx.reply("❌ You can't send FRI to yourself.");
 
-  if (String(recipient.telegramId) === String(ctx.from.id)) {
-    return ctx.reply("❌ You can't send FRI to yourself.");
-  }
+  // Execute transfer
+  const note = `Sent to @${recipient.username || recipient.firstName}`;
+  await debitFRI(ctx.from.id, amount, note);
+  await creditReceived(recipient.telegramId, amount, `Received from @${sender.username || sender.firstName}`);
 
-  // Debit sender
-  await debitFRI(ctx.from.id, amount);
+  const updated = await getUser(ctx.from.id);
+  const updatedRecipient = await getUser(recipient.telegramId);
 
-  // Credit recipient
-  await creditFRI(recipient.telegramId, amount);
-
-  // Notify sender
-  const updatedSender = await getUser(ctx.from.id);
-  await ctx.replyWithMarkdown(
-    sendSuccessMessage(
-      recipient.username || recipient.firstName,
-      amount,
-      updatedSender.friBalance
-    )
-  );
+  await ctx.replyWithMarkdown(sendSuccessMessage(
+    recipient.username || recipient.firstName, amount, updated.friBalance
+  ));
 
   // Notify recipient
   try {
     await bot.telegram.sendMessage(
       recipient.telegramId,
-      receiveMessage(ctx.from.first_name, amount),
+      receiveMessage(ctx.from.first_name, amount, updatedRecipient.friBalance),
       { parse_mode: 'Markdown' }
     );
   } catch {}
 });
 
+// ── /wallet ───────────────────────────────────────────────
+bot.command('wallet', async (ctx) => {
+  const parts   = ctx.message.text.trim().split(/\s+/);
+  const address = parts[1];
+  if (!address) {
+    const user = await getUser(ctx.from.id);
+    return ctx.replyWithMarkdown(
+      user?.walletAddress
+        ? `🔗 *Your Wallet:*\n\n\`${user.walletAddress}\`\n\nTo update: \`/wallet 0xNewAddress\``
+        : `🔗 *Link Your Wallet*\n\n\`/wallet 0xYourPolygonAddress\`\n\n_Get a free wallet at metamask.io_`
+    );
+  }
+  if (!isValidAddress(address)) return ctx.reply('❌ Invalid address. Please check and try again.');
+  await setWalletAddress(ctx.from.id, address);
+  await logTransaction(String(ctx.from.id), 'credit', 0, `Wallet linked: ${address.slice(0,6)}...${address.slice(-4)}`);
+  await ctx.replyWithMarkdown(walletLinkedMessage(address));
+});
+
 // ── /stats ────────────────────────────────────────────────
 bot.command('stats', async (ctx) => {
-  const loadMsg = await ctx.reply('📊 Fetching live stats...');
-  const [stats, totalUsers] = await Promise.all([
-    getFricoinStats(),
-    getTotalUsers(),
-  ]);
-  try {
-    await ctx.telegram.deleteMessage(ctx.chat.id, loadMsg.message_id);
-  } catch {}
-  await ctx.replyWithMarkdown(statsMessage(stats, totalUsers));
+  const [totalUsers, totalMined] = await Promise.all([getTotalUsers(), getTotalMinedGlobal()]);
+  await ctx.replyWithMarkdown(statsMessage(totalUsers, totalMined));
 });
 
 // ── /top ──────────────────────────────────────────────────
@@ -253,17 +295,69 @@ bot.command('top', async (ctx) => {
 });
 
 // ── Inline button callbacks ───────────────────────────────
-bot.action('mine',      async (ctx) => { await ctx.answerCbQuery(); await handleMine(ctx); });
-bot.action('balance',   async (ctx) => { await ctx.answerCbQuery(); ctx.message = { text: '/balance', ...ctx.update.callback_query.message }; await ctx.replyWithMarkdown(balanceMessage(await getUser(ctx.from.id), null)); });
-bot.action('stats',     async (ctx) => { await ctx.answerCbQuery(); const [s, u] = await Promise.all([getFricoinStats(), getTotalUsers()]); await ctx.replyWithMarkdown(statsMessage(s, u)); });
-bot.action('top',       async (ctx) => { await ctx.answerCbQuery(); const m = await getLeaderboard(10); await ctx.replyWithMarkdown(leaderboardMessage(m)); });
-bot.action('help',      async (ctx) => { await ctx.answerCbQuery(); await ctx.replyWithMarkdown(helpMessage()); });
-bot.action('send_help', async (ctx) => { await ctx.answerCbQuery(); await ctx.replyWithMarkdown(`📤 *Send FRI*\n\nFormat: \`/send @username amount\`\nExample: \`/send @john 500\``); });
+bot.action('mine',    async (ctx) => { await ctx.answerCbQuery(); await handleMine(ctx); });
+bot.action('balance', async (ctx) => {
+  await ctx.answerCbQuery();
+  const user = await getUser(ctx.from.id);
+  await ctx.replyWithMarkdown(balanceMessage(user, null));
+});
+bot.action('history', async (ctx) => {
+  await ctx.answerCbQuery();
+  const logs = await getTransactionHistory(ctx.from.id, 15);
+  await ctx.replyWithMarkdown(historyMessage(logs, ctx.from.first_name));
+});
+bot.action('refer', async (ctx) => {
+  await ctx.answerCbQuery();
+  const user = await getUser(ctx.from.id);
+  await ctx.replyWithMarkdown(referMessage(user));
+});
+bot.action('top', async (ctx) => {
+  await ctx.answerCbQuery();
+  const miners = await getLeaderboard(10);
+  await ctx.replyWithMarkdown(leaderboardMessage(miners));
+});
+bot.action('top_refs', async (ctx) => {
+  await ctx.answerCbQuery();
+  const { getReferralLeaderboard } = await import('../../lib/users.js');
+  const refs = await getReferralLeaderboard(10);
+  const medals = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
+  const rows = refs.map((r, i) =>
+    `${medals[i]} *${r.firstName}* — ${r.referralCount || 0} referrals`
+  ).join('\n');
+  await ctx.replyWithMarkdown(`🏆 *Top Referrers*\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n${rows}\n━━━━━━━━━━━━━━━━━━━━━━━━\n_Share your link → /refer_ 👥`);
+});
+
+// ── Channel verification button ───────────────────────────
+bot.action('verify_channel', async (ctx) => {
+  await ctx.answerCbQuery('Checking membership...');
+  const isMember = await isMemberOfChannel(ctx.from.id);
+
+  if (!isMember) {
+    return ctx.replyWithMarkdown(
+      `❌ *Not detected yet!*\n\nMake sure you joined ${CHANNEL_LINK} then tap the button again.`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📢 Join @FricoinNews', url: CHANNEL_LINK }],
+            [{ text: '✅ Check Again', callback_data: 'verify_channel' }],
+          ]
+        }
+      }
+    );
+  }
+
+  const bonusPaid = await giveChannelBonus(ctx.from.id);
+  if (bonusPaid) {
+    await ctx.replyWithMarkdown(channelJoinedMessage(ctx.from.first_name, 300));
+  } else {
+    await ctx.replyWithMarkdown(`✅ *Already verified!* You're a channel member.\n\nGo mine! → /mine ⛏️`);
+  }
+});
 
 // ── Webhook handler ───────────────────────────────────────
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
-    return res.status(200).json({ status: 'Fricoin Bot is alive 🪙' });
+    return res.status(200).json({ status: '🪙 Fricoin Bot v2 is alive!' });
   }
   try {
     await bot.handleUpdate(req.body);
@@ -274,6 +368,4 @@ export default async function handler(req, res) {
   }
 }
 
-export const config = {
-  api: { bodyParser: true },
-};
+export const config = { api: { bodyParser: true } };
